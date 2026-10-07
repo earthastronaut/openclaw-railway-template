@@ -2,6 +2,9 @@
 # Two-way sync between the OpenClaw workspace and a Cloudflare R2 bucket
 # (rclone bisync), with git snapshots of the workspace for rollback.
 #
+# Watchdog mode: triggers on file changes under /data/.openclaw/workspace,
+# with a quiet period to batch rapid changes.
+#
 # Opt-in: does nothing unless R2_BUCKET is set.
 #
 # Env:
@@ -11,7 +14,7 @@
 #   R2_ACCOUNT_ID         Cloudflare account id (required unless R2_ENDPOINT set)
 #   R2_ENDPOINT           override endpoint URL
 #   R2_PREFIX             optional key prefix inside the bucket
-#   R2_SYNC_INTERVAL      seconds between syncs (default 120)
+#   R2_DEBOUNCE_SECS      quiet period after last file change before syncing (default 5)
 #   R2_GIT_REMOTE         optional private git remote URL; snapshots are pushed to it
 #
 # Pause: `touch /data/.r2-sync-paused` (remove the file to resume).
@@ -25,7 +28,7 @@ fi
 DATA_DIR="${R2_DATA_DIR:-/data}"
 STATE_DIR="${OPENCLAW_STATE_DIR:-$DATA_DIR/.openclaw}"
 WORKSPACE_DIR="${OPENCLAW_WORKSPACE_DIR:-$STATE_DIR/workspace}"
-INTERVAL="${R2_SYNC_INTERVAL:-120}"
+DEBOUNCE_SECS="${R2_DEBOUNCE_SECS:-5}"
 PREFIX="${R2_PREFIX:-}"
 PREFIX="${PREFIX#/}"
 PREFIX="${PREFIX%/}"
@@ -33,6 +36,7 @@ PAUSE_FLAG="$DATA_DIR/.r2-sync-paused"
 WORKDIR="$DATA_DIR/.rclone-bisync"
 LOG_FILE="$STATE_DIR/r2-sync.log"
 FILTERS_FILE="$WORKDIR/filters.txt"
+LAST_CHANGE_FILE="/tmp/r2-sync-last-change"
 
 mkdir -p "$STATE_DIR" "$WORKSPACE_DIR" "$WORKDIR"
 
@@ -183,28 +187,69 @@ sync_cycle() {
   git_snapshot "post-sync"
 }
 
-# --- main loop --------------------------------------------------------------
+# --- watchdog: inotifywait loop --------------------------------------------------
 
 STOP=0
-SLEEP_PID=""
+DEBOUNCE_PID=""
 on_stop() {
   STOP=1
-  [ -n "$SLEEP_PID" ] && kill "$SLEEP_PID" 2>/dev/null
+  [ -n "$DEBOUNCE_PID" ] && kill "$DEBOUNCE_PID" 2>/dev/null
 }
 trap on_stop TERM INT
 
-log "starting: remote=$REMOTE interval=${INTERVAL}s workspace=$WORKSPACE_DIR"
+log "starting: remote=$REMOTE debounce=${DEBOUNCE_SECS}s workspace=$WORKSPACE_DIR"
 git_init
 
-while [ "$STOP" -eq 0 ]; do
-  rotate_log
-  sync_cycle
-  [ "$STOP" -eq 1 ] && break
-  sleep "$INTERVAL" &
-  SLEEP_PID=$!
-  wait "$SLEEP_PID" 2>/dev/null
-  SLEEP_PID=""
-done
+# Check for inotifywait; fall back to interval mode if not available.
+if ! command -v inotifywait &>/dev/null; then
+  log "warning: inotifywait not found; falling back to interval mode (60s)"
+  while [ "$STOP" -eq 0 ]; do
+    rotate_log
+    sync_cycle
+    [ "$STOP" -eq 1 ] && break
+    sleep 60 &
+    DEBOUNCE_PID=$!
+    wait "$DEBOUNCE_PID" 2>/dev/null
+    DEBOUNCE_PID=""
+  done
+else
+  # Watchdog mode: trigger sync on file changes, debounced.
+  on_change() {
+    rm -f "$LAST_CHANGE_FILE"
+    touch "$LAST_CHANGE_FILE"
+    # Debounce: wait for quiet period before syncing.
+    if [ -n "$DEBOUNCE_PID" ]; then
+      kill "$DEBOUNCE_PID" 2>/dev/null || true
+    fi
+    sleep "$DEBOUNCE_SECS" &
+    DEBOUNCE_PID=$!
+    wait "$DEBOUNCE_PID" 2>/dev/null || true
+    DEBOUNCE_PID=""
+    if [ "$STOP" -eq 0 ]; then
+      rotate_log
+      sync_cycle
+    fi
+  }
+  
+  export -f on_change rotate_log sync_cycle log git_snapshot run_bisync git_init have_listings
+  export STOP DEBOUNCE_PID DATA_DIR STATE_DIR WORKSPACE_DIR WORKDIR LOG_FILE FILTERS_FILE
+  export PAUSE_FLAG ENDPOINT REMOTE WORKDIR BISYNC_COMMON GIT
+  export WORKSPACE_DIR REMOTE WORKDIR FILTERS_FILE PAUSE_FLAG LOG_FILE STATE_DIR
+  export R2_GIT_REMOTE
+  
+  # Watch workspace for changes: ignore .git and common noise.
+  # Trigger on: create, write, delete, moved_to (catching file moves).
+  inotifywait -m -r \
+    --exclude '(\\.git|node_modules|__pycache__|.obsidian|.trash|.DS_Store|.*\\.tmp)' \
+    -e create,write,delete,moved_to,attrib \
+    "$WORKSPACE_DIR" 2>/dev/null | while read -r dir action file; do
+    if [ "$STOP" -eq 0 ]; then
+      on_change
+    else
+      break
+    fi
+  done
+fi
 
 log "stop requested; running final sync"
 # Ignore further signals so the final sync can finish.
