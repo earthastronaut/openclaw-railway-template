@@ -11,4 +11,26 @@ fi
 rm -rf /home/linuxbrew/.linuxbrew
 ln -sfn /data/.linuxbrew /home/linuxbrew/.linuxbrew
 
+# Optional R2 workspace sync. When enabled we keep this shell alive so that a
+# SIGTERM (redeploy) can be forwarded to both processes and the sync script
+# gets to run its final sync before the container exits.
+if [ -n "${R2_BUCKET:-}" ]; then
+  gosu openclaw /app/r2-sync.sh &
+  SYNC_PID=$!
+  gosu openclaw node src/server.js &
+  APP_PID=$!
+
+  trap 'kill -TERM "$APP_PID" 2>/dev/null || true' TERM INT
+
+  APP_CODE=0
+  while kill -0 "$APP_PID" 2>/dev/null; do
+    wait "$APP_PID" && APP_CODE=0 || APP_CODE=$?
+  done
+
+  # App is gone: tell the sync script to do its final sync, then wait for it.
+  kill -TERM "$SYNC_PID" 2>/dev/null || true
+  wait "$SYNC_PID" 2>/dev/null || true
+  exit "$APP_CODE"
+fi
+
 exec gosu openclaw node src/server.js

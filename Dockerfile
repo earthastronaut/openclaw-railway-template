@@ -21,6 +21,15 @@ RUN npm install -g \
   && openclaw --version | grep -Eq '^OpenClaw 2026\.9\.7( |$)'
 RUN npm install -g clawhub@latest
 
+# rclone (pinned) for optional R2 workspace sync; apt's version is too old for bisync
+ARG RCLONE_VERSION=v1.75.1
+RUN ARCH="$(dpkg --print-architecture)" \
+  && curl -fsSL -o /tmp/rclone.zip "https://downloads.rclone.org/${RCLONE_VERSION}/rclone-${RCLONE_VERSION}-linux-${ARCH}.zip" \
+  && unzip -q /tmp/rclone.zip -d /tmp \
+  && install -m 755 /tmp/rclone-${RCLONE_VERSION}-linux-${ARCH}/rclone /usr/local/bin/rclone \
+  && rm -rf /tmp/rclone* \
+  && rclone version
+
 WORKDIR /app
 
 COPY package.json pnpm-lock.yaml ./
@@ -29,6 +38,7 @@ RUN npm install -g pnpm@11.24.0 \
 
 COPY src ./src
 COPY --chmod=755 entrypoint.sh ./entrypoint.sh
+COPY --chmod=755 r2-sync.sh ./r2-sync.sh
 
 RUN useradd -m -s /bin/bash openclaw \
   && chown -R openclaw:openclaw /app \

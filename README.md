@@ -62,6 +62,62 @@ docker run --rm -p 8080:8080 \
 # Setup wizard: http://localhost:8080/setup (password: test)
 ```
 
+## Sync the workspace with Cloudflare R2 (Obsidian)
+
+Optional. A background job two-way syncs `/data/workspace` (`MEMORY.md`, `memory/`, `AGENTS.md`, skills, ...) with an R2 bucket using `rclone bisync`, so you can edit the markdown in Obsidian. Leave `R2_BUCKET` unset to disable it. `/data/.openclaw` (config, gateway token) is never synced.
+
+### 1. Cloudflare
+
+1. Create an R2 bucket (e.g. `openclaw-workspace`).
+2. Create an R2 API token with **Object Read & Write**, scoped to that bucket.
+3. Note your Account ID.
+
+### 2. Railway variables
+
+| Variable | Required | Description |
+| --- | --- | --- |
+| `R2_BUCKET` | yes | Bucket name. Enables the sync. |
+| `R2_ACCOUNT_ID` | yes* | Cloudflare account ID (*or set `R2_ENDPOINT`). |
+| `R2_ACCESS_KEY_ID` | yes | API token access key. |
+| `R2_SECRET_ACCESS_KEY` | yes | API token secret. |
+| `R2_PREFIX` | no | Key prefix inside the bucket. |
+| `R2_SYNC_INTERVAL` | no | Seconds between syncs (default `120`). |
+| `R2_GIT_REMOTE` | no | Private git remote URL (token included) that snapshots are pushed to. |
+
+On first run the local workspace and the bucket are merged (newest file wins). After that, deletes and edits propagate both ways. If the same file changes on both sides within one cycle, the newer one wins and the older is kept as a numbered copy (e.g. `MEMORY.md.conflict1`). On redeploy, the job runs one last sync before the container stops. Logs: stdout and `/data/.openclaw/r2-sync.log`.
+
+### 3. Obsidian
+
+Install the **Remotely Save** community plugin and set:
+
+- Service: S3 or S3-compatible; endpoint `https://<ACCOUNT_ID>.r2.cloudflarestorage.com`; region `auto`; the same bucket and keys.
+- "Remote Base Subdir": match `R2_PREFIX` if you use one.
+- Enable scheduled sync (e.g. every 5 minutes) and sync on startup.
+- Desktop: enable "Bypass CORS". Mobile: add a CORS rule to the bucket.
+- Do not sync the `.obsidian` config folder (the server also ignores it).
+
+The OpenClaw memory index watches the workspace, so synced edits are picked up without a restart. Expect a delay of a few minutes in each direction.
+
+### Rolling back
+
+R2 has no object versioning, so history is kept as git commits in `/data/workspace/.git` (never synced to R2). A snapshot is committed before and after every sync when something changed. From the Railway Console:
+
+```bash
+git -C /data/workspace log --oneline -- MEMORY.md      # history
+git -C /data/workspace diff <sha> -- MEMORY.md         # compare
+git -C /data/workspace checkout <sha> -- MEMORY.md     # restore one file
+git -C /data/workspace checkout <sha> -- .             # restore everything
+```
+
+A restore gives files a fresh modified time, so the next sync pushes them to R2 and Obsidian. For a large restore, pause the sync first and resume afterwards:
+
+```bash
+touch /data/.r2-sync-paused    # pause
+rm /data/.r2-sync-paused       # resume
+```
+
+Set `R2_GIT_REMOTE` to also push snapshots to a private repo, so history survives losing the volume. Changes are captured per sync cycle, not per edit.
+
 ## FAQ
 
 **Q: How do I access the setup page?**

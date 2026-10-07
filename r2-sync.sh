@@ -1,0 +1,213 @@
+#!/bin/bash
+# Two-way sync between the OpenClaw workspace and a Cloudflare R2 bucket
+# (rclone bisync), with git snapshots of the workspace for rollback.
+#
+# Opt-in: does nothing unless R2_BUCKET is set.
+#
+# Env:
+#   R2_BUCKET             bucket name (required to enable)
+#   R2_ACCESS_KEY_ID      R2 API token access key (required)
+#   R2_SECRET_ACCESS_KEY  R2 API token secret (required)
+#   R2_ACCOUNT_ID         Cloudflare account id (required unless R2_ENDPOINT set)
+#   R2_ENDPOINT           override endpoint URL
+#   R2_PREFIX             optional key prefix inside the bucket
+#   R2_SYNC_INTERVAL      seconds between syncs (default 120)
+#   R2_GIT_REMOTE         optional private git remote URL; snapshots are pushed to it
+#
+# Pause: `touch /data/.r2-sync-paused` (remove the file to resume).
+
+set -u
+
+if [ -z "${R2_BUCKET:-}" ]; then
+  exit 0
+fi
+
+DATA_DIR="${R2_DATA_DIR:-/data}"
+STATE_DIR="${OPENCLAW_STATE_DIR:-$DATA_DIR/.openclaw}"
+WORKSPACE_DIR="${OPENCLAW_WORKSPACE_DIR:-$STATE_DIR/workspace}"
+INTERVAL="${R2_SYNC_INTERVAL:-120}"
+PREFIX="${R2_PREFIX:-}"
+PREFIX="${PREFIX#/}"
+PREFIX="${PREFIX%/}"
+PAUSE_FLAG="$DATA_DIR/.r2-sync-paused"
+WORKDIR="$DATA_DIR/.rclone-bisync"
+LOG_FILE="$STATE_DIR/r2-sync.log"
+FILTERS_FILE="$WORKDIR/filters.txt"
+
+mkdir -p "$STATE_DIR" "$WORKSPACE_DIR" "$WORKDIR"
+
+log() {
+  local line
+  line="[r2-sync] $(date -u +%FT%TZ) $*"
+  echo "$line"
+  echo "$line" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+# Keep the log from growing without bound (~1MB).
+rotate_log() {
+  if [ -f "$LOG_FILE" ] && [ "$(wc -c < "$LOG_FILE")" -gt 1048576 ]; then
+    tail -n 2000 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
+  fi
+}
+
+if [ -z "${R2_ACCESS_KEY_ID:-}" ] || [ -z "${R2_SECRET_ACCESS_KEY:-}" ]; then
+  log "R2_BUCKET is set but R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY are missing; sync disabled"
+  exit 0
+fi
+
+ENDPOINT="${R2_ENDPOINT:-}"
+if [ -z "$ENDPOINT" ]; then
+  if [ -z "${R2_ACCOUNT_ID:-}" ]; then
+    log "Set R2_ACCOUNT_ID (or R2_ENDPOINT); sync disabled"
+    exit 0
+  fi
+  ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+fi
+
+# rclone remote "r2" configured purely from env (no config file).
+export RCLONE_CONFIG_R2_TYPE=s3
+export RCLONE_CONFIG_R2_PROVIDER=Cloudflare
+export RCLONE_CONFIG_R2_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+export RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+export RCLONE_CONFIG_R2_ENDPOINT="$ENDPOINT"
+export RCLONE_CONFIG_R2_REGION=auto
+export RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true
+export RCLONE_CONFIG_R2_ACL=private
+
+REMOTE="r2:${R2_BUCKET}"
+[ -n "$PREFIX" ] && REMOTE="${REMOTE}/${PREFIX}"
+
+cat > "$FILTERS_FILE" <<'EOF'
+- .git/**
+- node_modules/**
+- .obsidian/**
+- .trash/**
+- _remotely-save-metadata-on-remote.json
+- .DS_Store
+- *.tmp
+EOF
+
+# --- git snapshots ----------------------------------------------------------
+
+GIT=(git -C "$WORKSPACE_DIR" -c user.name="openclaw-r2-sync" -c user.email="r2-sync@localhost")
+
+git_init() {
+  if [ ! -d "$WORKSPACE_DIR/.git" ]; then
+    "${GIT[@]}" init -q -b main >/dev/null 2>&1 || "${GIT[@]}" init -q >/dev/null 2>&1
+    log "initialised git repo in $WORKSPACE_DIR"
+  fi
+  # Local-only ignores: kept out of the synced tree.
+  mkdir -p "$WORKSPACE_DIR/.git/info"
+  for pat in 'node_modules/' '*.tmp' '.obsidian/' '.trash/' '.DS_Store'; do
+    grep -qxF "$pat" "$WORKSPACE_DIR/.git/info/exclude" 2>/dev/null \
+      || echo "$pat" >> "$WORKSPACE_DIR/.git/info/exclude"
+  done
+  if [ -n "${R2_GIT_REMOTE:-}" ]; then
+    if "${GIT[@]}" remote get-url r2backup >/dev/null 2>&1; then
+      "${GIT[@]}" remote set-url r2backup "$R2_GIT_REMOTE"
+    else
+      "${GIT[@]}" remote add r2backup "$R2_GIT_REMOTE"
+    fi
+  fi
+}
+
+git_snapshot() {
+  local label="$1"
+  "${GIT[@]}" add -A >/dev/null 2>&1 || return 0
+  if ! "${GIT[@]}" diff --cached --quiet 2>/dev/null; then
+    if "${GIT[@]}" commit -q -m "$label $(date -u +%FT%TZ)" >/dev/null 2>&1; then
+      log "git snapshot: $label"
+      if [ -n "${R2_GIT_REMOTE:-}" ]; then
+        # Output suppressed: the remote URL may contain a token.
+        "${GIT[@]}" push -q r2backup HEAD:refs/heads/main >/dev/null 2>&1 \
+          || log "git push to R2_GIT_REMOTE failed (will retry on next snapshot)"
+      fi
+    fi
+  fi
+  "${GIT[@]}" gc --auto -q >/dev/null 2>&1 || true
+}
+
+# --- bisync -----------------------------------------------------------------
+
+BISYNC_COMMON=(
+  --workdir "$WORKDIR"
+  --filters-file "$FILTERS_FILE"
+  --conflict-resolve newer
+  --conflict-loser num
+  --resilient
+  --recover
+  --max-delete 25
+  --create-empty-src-dirs
+  --fast-list
+)
+
+have_listings() {
+  ls "$WORKDIR"/*.lst >/dev/null 2>&1
+}
+
+run_bisync() {
+  local mode="${1:-normal}" out rc
+  if [ "$mode" = "resync" ]; then
+    log "running initial resync (merging local and R2, newest wins)"
+    out=$(rclone bisync "$WORKSPACE_DIR" "$REMOTE" "${BISYNC_COMMON[@]}" --resync --resync-mode newer 2>&1)
+    rc=$?
+  else
+    out=$(rclone bisync "$WORKSPACE_DIR" "$REMOTE" "${BISYNC_COMMON[@]}" 2>&1)
+    rc=$?
+  fi
+  if [ $rc -ne 0 ]; then
+    log "bisync exited $rc: $(echo "$out" | tail -n 8 | tr '\n' ' ')"
+  fi
+  return $rc
+}
+
+sync_cycle() {
+  if [ -e "$PAUSE_FLAG" ]; then
+    log "paused ($PAUSE_FLAG exists); skipping"
+    return 0
+  fi
+
+  git_snapshot "pre-sync"
+
+  if ! have_listings; then
+    run_bisync resync
+  else
+    run_bisync normal
+    local rc=$?
+    # 7 = critical error requiring --resync (lost state, filter change, ...)
+    if [ $rc -eq 7 ]; then
+      run_bisync resync
+    fi
+  fi
+
+  git_snapshot "post-sync"
+}
+
+# --- main loop --------------------------------------------------------------
+
+STOP=0
+SLEEP_PID=""
+on_stop() {
+  STOP=1
+  [ -n "$SLEEP_PID" ] && kill "$SLEEP_PID" 2>/dev/null
+}
+trap on_stop TERM INT
+
+log "starting: remote=$REMOTE interval=${INTERVAL}s workspace=$WORKSPACE_DIR"
+git_init
+
+while [ "$STOP" -eq 0 ]; do
+  rotate_log
+  sync_cycle
+  [ "$STOP" -eq 1 ] && break
+  sleep "$INTERVAL" &
+  SLEEP_PID=$!
+  wait "$SLEEP_PID" 2>/dev/null
+  SLEEP_PID=""
+done
+
+log "stop requested; running final sync"
+# Ignore further signals so the final sync can finish.
+trap '' TERM INT
+sync_cycle
+log "exiting"
