@@ -22,11 +22,11 @@ RUN npm install -g \
 RUN npm install -g clawhub@latest
 
 # rclone (pinned) for optional R2 workspace sync; apt's version is too old for bisync
-ARG RCLONE_VERSION=v1.75.1
+ARG RCLONE_RELEASE=v1.75.1
 RUN ARCH="$(dpkg --print-architecture)" \
-  && curl -fsSL -o /tmp/rclone.zip "https://downloads.rclone.org/${RCLONE_VERSION}/rclone-${RCLONE_VERSION}-linux-${ARCH}.zip" \
+  && curl -fsSL -o /tmp/rclone.zip "https://downloads.rclone.org/${RCLONE_RELEASE}/rclone-${RCLONE_RELEASE}-linux-${ARCH}.zip" \
   && unzip -q /tmp/rclone.zip -d /tmp \
-  && install -m 755 /tmp/rclone-${RCLONE_VERSION}-linux-${ARCH}/rclone /usr/local/bin/rclone \
+  && install -m 755 /tmp/rclone-${RCLONE_RELEASE}-linux-${ARCH}/rclone /usr/local/bin/rclone \
   && rm -rf /tmp/rclone* \
   && rclone version
 
