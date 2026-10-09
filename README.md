@@ -62,6 +62,13 @@ docker run --rm -p 8080:8080 \
 # Setup wizard: http://localhost:8080/setup (password: test)
 ```
 
+## Console helpers
+
+Scripts in `bin/` are installed to `/app/bin` and are on `PATH` in the Railway console:
+
+- `cdw` — `cd` to the workspace directory (`OPENCLAW_WORKSPACE_DIR`, falling back to `${OPENCLAW_STATE_DIR:-/data/.openclaw}/workspace`). It is a shell alias, so it changes your current shell's directory.
+- `r2-sync` — the R2 workspace sync job (see below). The entrypoint already runs it in the background when `R2_BUCKET` is set.
+
 ## Sync the workspace with Cloudflare R2 (Obsidian)
 
 Optional. A background job two-way syncs `/data/workspace` (`MEMORY.md`, `memory/`, `AGENTS.md`, skills, ...) with an R2 bucket using `rclone bisync`, so you can edit the markdown in Obsidian. Leave `R2_BUCKET` unset to disable it. `/data/.openclaw` (config, gateway token) is never synced.
@@ -81,8 +88,11 @@ Optional. A background job two-way syncs `/data/workspace` (`MEMORY.md`, `memory
 | `R2_ACCESS_KEY_ID` | yes | API token access key. |
 | `R2_SECRET_ACCESS_KEY` | yes | API token secret. |
 | `R2_PREFIX` | no | Key prefix inside the bucket. |
-| `R2_SYNC_INTERVAL` | no | Seconds between syncs (default `120`). |
+| `R2_SYNC_INTERVAL` | no | Max seconds between syncs (default `120`). |
+| `R2_SYNC_DEBOUNCE` | no | Quiet period after the last change before syncing (default `5`). |
 | `R2_GIT_REMOTE` | no | Private git remote URL (token included) that snapshots are pushed to. |
+
+The job watches the workspace with inotify, so a sync starts a few seconds after the agent writes a file rather than on a fixed schedule. `R2_SYNC_INTERVAL` is the ceiling: if nothing changes locally it still syncs that often, which is how edits made in Obsidian get pulled down.
 
 On first run the local workspace and the bucket are merged (newest file wins). After that, deletes and edits propagate both ways. If the same file changes on both sides within one cycle, the newer one wins and the older is kept as a numbered copy (e.g. `MEMORY.md.conflict1`). On redeploy, the job runs one last sync before the container stops. Logs: stdout and `/data/.openclaw/r2-sync.log`.
 

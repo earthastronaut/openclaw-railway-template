@@ -6,6 +6,7 @@ RUN apt-get update \
     curl \
     git \
     gosu \
+    inotify-tools \
     procps \
     python3 \
     tini \
@@ -38,7 +39,19 @@ RUN npm install -g pnpm@11.24.0 \
 
 COPY src ./src
 COPY --chmod=755 entrypoint.sh ./entrypoint.sh
-COPY --chmod=755 r2-sync.sh ./r2-sync.sh
+COPY --chmod=755 bin ./bin
+
+# Console helpers: /app/bin on PATH and `cdw` for both login and interactive
+# non-login shells, since /etc/profile rebuilds PATH from scratch.
+RUN printf '%s\n' \
+  'for d in /home/linuxbrew/.linuxbrew/sbin /home/linuxbrew/.linuxbrew/bin /app/bin; do' \
+  '  case ":$PATH:" in *":$d:"*) ;; *) PATH="$d:$PATH" ;; esac' \
+  'done' \
+  'export PATH' \
+  'alias cdw='"'"'cd "${OPENCLAW_WORKSPACE_DIR:-${OPENCLAW_STATE_DIR:-/data/.openclaw}/workspace}"'"'"'' \
+  > /etc/profile.d/openclaw.sh \
+  && chmod 644 /etc/profile.d/openclaw.sh \
+  && echo '[ -r /etc/profile.d/openclaw.sh ] && . /etc/profile.d/openclaw.sh' >> /etc/bash.bashrc
 
 RUN useradd -m -s /bin/bash openclaw \
   && chown -R openclaw:openclaw /app \
@@ -48,7 +61,7 @@ RUN useradd -m -s /bin/bash openclaw \
 USER openclaw
 RUN NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 
-ENV PATH="/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}"
+ENV PATH="/app/bin:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}"
 ENV HOMEBREW_PREFIX="/home/linuxbrew/.linuxbrew"
 ENV HOMEBREW_CELLAR="/home/linuxbrew/.linuxbrew/Cellar"
 ENV HOMEBREW_REPOSITORY="/home/linuxbrew/.linuxbrew/Homebrew"

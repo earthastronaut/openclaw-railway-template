@@ -15,7 +15,7 @@ ln -sfn /data/.linuxbrew /home/linuxbrew/.linuxbrew
 # SIGTERM (redeploy) can be forwarded to both processes and the sync script
 # gets to run its final sync before the container exits.
 if [ -n "${R2_BUCKET:-}" ]; then
-  gosu openclaw /app/r2-sync.sh &
+  gosu openclaw /app/bin/r2-sync &
   SYNC_PID=$!
   gosu openclaw node src/server.js &
   APP_PID=$!
