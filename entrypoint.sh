@@ -18,26 +18,35 @@ fi
 rm -rf /home/linuxbrew/.linuxbrew
 ln -sfn /data/.linuxbrew /home/linuxbrew/.linuxbrew
 
-# Optional R2 workspace sync. When enabled we keep this shell alive so that a
-# SIGTERM (redeploy) can be forwarded to both processes and the sync script
-# gets to run its final sync before the container exits.
+# Stay as the supervisor so SIGTERM (redeploy) reaches the wrapper and the
+# background jobs. update-models watches models.md under the state dir.
+# r2-sync, when R2_BUCKET is set, needs the signal so it can run a final sync
+# before exit.
+gosu openclaw /app/bin/update-models --watch "${OPENCLAW_STATE_DIR:-/data/.openclaw}/workspace/models.md" &
+MODELS_PID=$!
+
+SYNC_PID=""
 if [ -n "${R2_BUCKET:-}" ]; then
   gosu openclaw /app/bin/r2-sync &
   SYNC_PID=$!
-  gosu openclaw node src/server.js &
-  APP_PID=$!
-
-  trap 'kill -TERM "$APP_PID" 2>/dev/null || true' TERM INT
-
-  APP_CODE=0
-  while kill -0 "$APP_PID" 2>/dev/null; do
-    wait "$APP_PID" && APP_CODE=0 || APP_CODE=$?
-  done
-
-  # App is gone: tell the sync script to do its final sync, then wait for it.
-  kill -TERM "$SYNC_PID" 2>/dev/null || true
-  wait "$SYNC_PID" 2>/dev/null || true
-  exit "$APP_CODE"
 fi
 
-exec gosu openclaw node src/server.js
+gosu openclaw node src/server.js &
+APP_PID=$!
+
+trap 'kill -TERM "$APP_PID" 2>/dev/null || true' TERM INT
+
+APP_CODE=0
+while kill -0 "$APP_PID" 2>/dev/null; do
+  wait "$APP_PID" && APP_CODE=0 || APP_CODE=$?
+done
+
+kill -TERM "$MODELS_PID" 2>/dev/null || true
+if [ -n "$SYNC_PID" ]; then
+  kill -TERM "$SYNC_PID" 2>/dev/null || true
+fi
+wait "$MODELS_PID" 2>/dev/null || true
+if [ -n "$SYNC_PID" ]; then
+  wait "$SYNC_PID" 2>/dev/null || true
+fi
+exit "$APP_CODE"

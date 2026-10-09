@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""Merge the first JSON block in models.md into openclaw.json.
+
+With no arguments, reads models.md once and exits. To keep applying changes
+until SIGTERM or SIGINT:
+
+  update-models --watch ${OPENCLAW_STATE_DIR}/workspace/models.md
+
+The one-shot read uses ${OPENCLAW_WORKSPACE_DIR}/models.md when that variable
+is set, otherwise ${OPENCLAW_STATE_DIR}/workspace/models.md. --watch uses the
+path you pass. The JSON object is deep-merged into
+${OPENCLAW_STATE_DIR}/openclaw.json. Before that file is replaced, the merged
+document is checked with `openclaw config validate`. A schema failure leaves
+the current file unchanged. A timestamped backup is written beside the config
+before each accepted change.
+
+Nested objects merge, so settings the JSON block does not mention are kept.
+Lists and scalars are replaced. agents.defaults.models is replaced wholesale:
+it is an allowlist, and model ids removed from models.md are removed from the
+config.
+
+Does not create openclaw.json when it is missing (that file is what marks
+setup as finished).
+
+Env:
+  OPENCLAW_STATE_DIR       config directory (default /data/.openclaw)
+  OPENCLAW_WORKSPACE_DIR   workspace for the one-shot read (default
+                           ${OPENCLAW_STATE_DIR}/workspace)
+  UPDATE_MODELS_POLL       seconds between checks in --watch (default 2)
+  UPDATE_MODELS_DEBOUNCE   quiet period after an edit before applying (default 2)
+"""
+
+from __future__ import annotations
+
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+FENCE_RE = re.compile(
+    r"^[ \t]*```([^\n`]*)[ \t]*\n(.*?)^[ \t]*```[ \t]*$",
+    re.MULTILINE | re.DOTALL,
+)
+# Allowlist of model ids. Replacing it drops ids removed from models.md.
+MODELS_ALLOWLIST = ("agents", "defaults", "models")
+BACKUPS_TO_KEEP = 20
+LOG_MAX_BYTES = 1_048_576
+VALIDATE_TIMEOUT_SECONDS = 60
+
+STOP = False
+
+
+def state_dir() -> Path:
+    raw = os.environ.get("OPENCLAW_STATE_DIR", "").strip()
+    return Path(raw or "/data/.openclaw")
+
+
+def models_path() -> Path:
+    workspace = os.environ.get("OPENCLAW_WORKSPACE_DIR", "").strip()
+    if workspace:
+        return Path(workspace) / "models.md"
+    return state_dir() / "workspace" / "models.md"
+
+
+def config_path() -> Path:
+    return state_dir() / "openclaw.json"
+
+
+def log_path() -> Path:
+    return state_dir() / "update-models.log"
+
+
+def env_seconds(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    if value < 0:
+        return default
+    return value
+
+
+def log(message: str) -> None:
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    line = f"[update-models] {stamp} {message}"
+    print(line, flush=True)
+    path = log_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > LOG_MAX_BYTES:
+            tail = path.read_text(encoding="utf-8", errors="replace").splitlines()[-2000:]
+            path.write_text("\n".join(tail) + ("\n" if tail else ""), encoding="utf-8")
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError:
+        pass
+
+
+def on_stop(signum, _frame) -> None:
+    global STOP
+    STOP = True
+
+
+def interruptible_sleep(seconds: float) -> bool:
+    """Sleep up to `seconds`. Return True when shutdown was requested."""
+    deadline = time.monotonic() + seconds
+    while not STOP:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.2, remaining))
+    return True
+
+
+def first_json_object(text: str):
+    """Return the first fenced JSON object, or None when models.md has none.
+
+    A fence tagged ```json is the JSON block. If it does not parse, that is an
+    error rather than a reason to look further down the file. With no tagged
+    block, the first other fence that parses as a JSON object is used.
+    """
+    normalized = text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    tagged = []
+    other = []
+    for match in FENCE_RE.finditer(normalized):
+        info = match.group(1).strip().lower()
+        lang = info.split()[0] if info else ""
+        body = match.group(2).strip()
+        if lang == "json":
+            tagged.append(body)
+        else:
+            other.append(body)
+
+    if tagged:
+        return load_object(tagged[0])
+    for body in other:
+        try:
+            value = json.loads(body)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def load_object(body: str):
+    try:
+        value = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"JSON block is invalid: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError("JSON block must be an object")
+    return value
+
+
+def merge(base, patch, path=()):
+    """Deep-merge patch onto base. Lists and scalars in the patch replace."""
+    if not isinstance(base, dict):
+        base = {}
+    merged = dict(base)
+    for key, value in patch.items():
+        child = path + (key,)
+        current = merged.get(key)
+        if child == MODELS_ALLOWLIST and isinstance(value, dict):
+            merged[key] = value
+        elif isinstance(value, dict) and isinstance(current, dict):
+            merged[key] = merge(current, value, child)
+        else:
+            merged[key] = value
+    return merged
+
+
+def stable(value) -> str:
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+@contextlib.contextmanager
+def config_lock(directory: Path):
+    directory.mkdir(parents=True, exist_ok=True)
+    lock_file = directory / ".update-models.lock"
+    with lock_file.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def backup_path(config: Path) -> Path:
+    now = datetime.now(timezone.utc)
+    stamp = now.strftime("%Y-%m-%dT%H-%M-%S-") + f"{now.microsecond // 1000:03d}Z"
+    dest = config.with_name(f"{config.name}.bak-{stamp}")
+    extra = 0
+    while dest.exists():
+        extra += 1
+        dest = config.with_name(f"{config.name}.bak-{stamp}-{extra}")
+    return dest
+
+
+def prune_backups(config: Path) -> None:
+    found = [
+        path
+        for path in config.parent.glob(f"{config.name}.bak-*")
+        if path.is_file()
+    ]
+    found.sort(key=lambda path: path.name)
+    for old in found[:-BACKUPS_TO_KEEP]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
+def openclaw_command(*args: str) -> list[str]:
+    entry = os.environ.get("OPENCLAW_ENTRY", "").strip()
+    node = os.environ.get("OPENCLAW_NODE", "").strip() or "node"
+    if entry:
+        return [node, entry, *args]
+    return ["openclaw", *args]
+
+
+def schema_error(report: dict, stdout: str, stderr: str) -> str:
+    issues = report.get("issues")
+    lines = []
+    if isinstance(issues, list):
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            path = issue.get("path") or "<root>"
+            message = issue.get("message") or "invalid"
+            lines.append(f"{path}: {message}")
+    if lines:
+        return "config schema rejected the update: " + "; ".join(lines)
+    error = report.get("error")
+    if isinstance(error, str) and error.strip():
+        return f"config schema rejected the update: {error.strip()}"
+    detail = (stderr or stdout).strip()
+    if detail:
+        return "config schema rejected the update: " + " ".join(detail.split())
+    return "config schema rejected the update"
+
+
+def parse_validate_report(stdout: str) -> dict:
+    text = stdout.strip()
+    if not text:
+        return {}
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            return {}
+        try:
+            value = json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+def validate_payload(payload: str) -> None:
+    """Raise ValueError unless OpenClaw accepts this config document."""
+    fd, name = tempfile.mkstemp(prefix="openclaw-validate-", suffix=".json")
+    path = Path(name)
+    closed = False
+    try:
+        os.write(fd, payload.encode("utf-8"))
+        os.close(fd)
+        closed = True
+        os.chmod(path, 0o600)
+        env = os.environ.copy()
+        env["OPENCLAW_CONFIG_PATH"] = str(path)
+        try:
+            proc = subprocess.run(
+                openclaw_command("config", "validate", "--json"),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=VALIDATE_TIMEOUT_SECONDS,
+            )
+        except FileNotFoundError as exc:
+            raise ValueError("openclaw is not available; not writing config") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise ValueError("openclaw config validate timed out; not writing config") from exc
+        report = parse_validate_report(proc.stdout)
+        if proc.returncode == 0 and report.get("valid") is True:
+            return
+        raise ValueError(schema_error(report, proc.stdout, proc.stderr))
+    finally:
+        if not closed:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def atomic_write(config: Path, payload: str) -> None:
+    tmp = config.with_name(f".{config.name}.tmp-{os.getpid()}-{time.time_ns()}")
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, config)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def apply_text(text: str) -> str | None:
+    """Merge models.md into openclaw.json. Return a log line, or None if unchanged."""
+    patch = first_json_object(text)
+    if patch is None:
+        return "no JSON block in models.md; leaving config unchanged"
+
+    directory = state_dir()
+    config = config_path()
+    # Setup is unfinished until this file exists. Don't create it from models.md.
+    if not config.is_file():
+        return f"{config} does not exist yet; not creating it"
+
+    with config_lock(directory):
+        if not config.is_file():
+            return f"{config} does not exist yet; not creating it"
+        raw = config.read_text(encoding="utf-8")
+        try:
+            current = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{config} is not valid JSON: {exc}") from exc
+        if not isinstance(current, dict):
+            raise ValueError(f"{config} must be a JSON object")
+
+        merged = merge(current, patch)
+        if stable(current) == stable(merged):
+            return None
+
+        payload = json.dumps(merged, indent=2, ensure_ascii=False) + "\n"
+        validate_payload(payload)
+
+        backup = backup_path(config)
+        shutil.copy2(config, backup)
+        os.chmod(backup, 0o600)
+        atomic_write(config, payload)
+        prune_backups(config)
+        return f"updated {config} (backup {backup.name})"
+
+
+def read_models(path: Path):
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+
+
+def run_once(path: Path) -> int:
+    try:
+        text = read_models(path)
+    except OSError as exc:
+        log(f"cannot read {path}: {exc}")
+        return 1
+    if text is None:
+        log(f"{path} not found; nothing to do")
+        return 0
+    try:
+        message = apply_text(text)
+    except (OSError, ValueError) as exc:
+        log(f"update failed: {exc}")
+        return 1
+    if message:
+        log(message)
+    else:
+        log(f"{config_path()} already matches {path}")
+    return 0
+
+
+def watch(path: Path) -> None:
+    poll = env_seconds("UPDATE_MODELS_POLL", 1)
+    debounce = env_seconds("UPDATE_MODELS_DEBOUNCE", 5)
+    log(f"watching {path} -> {config_path()} poll={poll:g}s debounce={debounce:g}s")
+
+    seen = None
+    pending = None
+    pending_since = 0.0
+    last_logged = None
+
+    def say(message: str | None) -> None:
+        nonlocal last_logged
+        if message and message != last_logged:
+            log(message)
+            last_logged = message
+
+    while not STOP:
+        try:
+            text = read_models(path)
+        except OSError as exc:
+            say(f"cannot read {path}: {exc}")
+            if interruptible_sleep(poll):
+                break
+            continue
+
+        if text is None:
+            seen = None
+            pending = None
+            say(f"waiting for {path}")
+            if interruptible_sleep(poll):
+                break
+            continue
+
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if digest == seen:
+            pending = None
+            if interruptible_sleep(poll):
+                break
+            continue
+
+        now = time.monotonic()
+        if digest != pending:
+            pending = digest
+            pending_since = now
+            # First version (startup, or the file just appeared) applies
+            # immediately. Later edits wait out the quiet period.
+            if seen is not None:
+                if interruptible_sleep(min(debounce, poll)):
+                    break
+                continue
+        elif now - pending_since < debounce:
+            if interruptible_sleep(poll):
+                break
+            continue
+
+        try:
+            message = apply_text(text)
+        except (OSError, ValueError) as exc:
+            say(f"update failed: {exc}")
+            if interruptible_sleep(poll):
+                break
+            continue
+
+        seen = digest
+        pending = None
+        if message:
+            say(message)
+        else:
+            last_logged = None
+        if interruptible_sleep(poll):
+            break
+
+    log("exiting")
+
+
+def main(argv: list[str]) -> int:
+    watch_path = None
+    args = argv[1:]
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--watch":
+            if index + 1 >= len(args) or args[index + 1].startswith("-"):
+                print("usage: update-models --watch PATH", file=sys.stderr)
+                return 2
+            index += 1
+            watch_path = Path(args[index])
+        elif arg in {"-h", "--help"}:
+            print(__doc__.strip())
+            return 0
+        else:
+            print(f"unknown argument: {arg}", file=sys.stderr)
+            return 2
+        index += 1
+
+    signal.signal(signal.SIGTERM, on_stop)
+    signal.signal(signal.SIGINT, on_stop)
+    if watch_path is None:
+        return run_once(models_path())
+    watch(watch_path)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
