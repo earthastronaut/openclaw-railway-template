@@ -1,6 +1,13 @@
 #!/bin/bash
 set -e
 
+# /proc/1/environ is root-only. Login shells source
+# /etc/profile.d/container-env.sh, which reads this copy.
+mkdir -p /run
+cat /proc/self/environ > /run/container.env
+chmod 644 /run/container.env
+
+mkdir -p /data/.openclaw
 chown -R openclaw:openclaw /data
 chmod 700 /data
 

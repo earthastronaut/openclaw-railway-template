@@ -40,22 +40,19 @@ RUN npm install -g pnpm@11.24.0 \
 COPY src ./src
 COPY --chmod=755 entrypoint.sh ./entrypoint.sh
 COPY --chmod=755 bin ./bin
+COPY --chmod=644 docker/etc/profile.d/ /etc/profile.d/
+COPY docker/etc/bash.bashrc.d/openclaw.sh /tmp/openclaw-bashrc
+RUN cat /tmp/openclaw-bashrc >> /etc/bash.bashrc && rm /tmp/openclaw-bashrc
 
-# Console helpers: /app/bin on PATH and `cdw` for both login and interactive
-# non-login shells, since /etc/profile rebuilds PATH from scratch.
-RUN printf '%s\n' \
-  'for d in /home/linuxbrew/.linuxbrew/sbin /home/linuxbrew/.linuxbrew/bin /app/bin; do' \
-  '  case ":$PATH:" in *":$d:"*) ;; *) PATH="$d:$PATH" ;; esac' \
-  'done' \
-  'export PATH' \
-  'alias cdw='"'"'cd "${OPENCLAW_WORKSPACE_DIR:-${OPENCLAW_STATE_DIR:-/data/.openclaw}/workspace}"'"'"'' \
-  > /etc/profile.d/openclaw.sh \
-  && chmod 644 /etc/profile.d/openclaw.sh \
-  && echo '[ -r /etc/profile.d/openclaw.sh ] && . /etc/profile.d/openclaw.sh' >> /etc/bash.bashrc
-
+# ~/.openclaw follows the volume so CLI sessions and the default state dir
+# share one persistent directory. The mount hides /data at runtime; entrypoint
+# recreates the target.
 RUN useradd -m -s /bin/bash openclaw \
   && chown -R openclaw:openclaw /app \
-  && mkdir -p /data && chown openclaw:openclaw /data \
+  && mkdir -p /data/.openclaw \
+  && chown openclaw:openclaw /data /data/.openclaw \
+  && ln -sfn /data/.openclaw /home/openclaw/.openclaw \
+  && chown -h openclaw:openclaw /home/openclaw/.openclaw \
   && mkdir -p /home/linuxbrew/.linuxbrew && chown -R openclaw:openclaw /home/linuxbrew
 
 USER openclaw
