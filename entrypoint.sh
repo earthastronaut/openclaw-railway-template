@@ -7,9 +7,17 @@ mkdir -p /run
 cat /proc/self/environ > /run/container.env
 chmod 644 /run/container.env
 
-mkdir -p /data/.openclaw
+mkdir -p /data/.openclaw/ssh
 chown -R openclaw:openclaw /data
-chmod 700 /data
+chmod 700 /data /data/.openclaw/ssh
+# Keys are created on the volume (github / github.pub). ~/.ssh follows that
+# directory. /etc/ssh/ssh_config.d/github.conf selects this key for github.com.
+# Private key must be 600 or ssh refuses it.
+if [ -f /data/.openclaw/ssh/github ]; then
+  chmod 600 /data/.openclaw/ssh/github
+fi
+ln -sfn /data/.openclaw/ssh /home/openclaw/.ssh
+chown -h openclaw:openclaw /home/openclaw/.ssh
 
 if [ ! -d /data/.linuxbrew ]; then
   cp -a /home/linuxbrew/.linuxbrew /data/.linuxbrew

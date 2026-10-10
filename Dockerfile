@@ -6,6 +6,7 @@ RUN apt-get update \
     curl \
     git \
     gosu \
+    openssh-client \
     inotify-tools \
     procps \
     python3 \
@@ -41,18 +42,21 @@ COPY src ./src
 COPY --chmod=755 entrypoint.sh ./entrypoint.sh
 COPY --chmod=755 bin ./bin
 COPY --chmod=644 docker/etc/profile.d/ /etc/profile.d/
+COPY --chmod=644 docker/etc/ssh/ssh_config.d/github.conf /etc/ssh/ssh_config.d/github.conf
 COPY docker/etc/bash.bashrc.d/openclaw.sh /tmp/openclaw-bashrc
 RUN cat /tmp/openclaw-bashrc >> /etc/bash.bashrc && rm /tmp/openclaw-bashrc
 
-# ~/.openclaw follows the volume so CLI sessions and the default state dir
-# share one persistent directory. The mount hides /data at runtime; entrypoint
-# recreates the target.
+# ~/.openclaw and ~/.ssh follow the volume so CLI sessions, the default state
+# dir, and the GitHub key pair share one persistent directory. The mount hides
+# /data at runtime; entrypoint recreates the targets and the ~/.ssh link.
 RUN useradd -m -s /bin/bash openclaw \
   && chown -R openclaw:openclaw /app \
-  && mkdir -p /data/.openclaw \
-  && chown openclaw:openclaw /data /data/.openclaw \
+  && mkdir -p /data/.openclaw/ssh \
+  && chmod 700 /data/.openclaw/ssh \
+  && chown openclaw:openclaw /data /data/.openclaw /data/.openclaw/ssh \
   && ln -sfn /data/.openclaw /home/openclaw/.openclaw \
-  && chown -h openclaw:openclaw /home/openclaw/.openclaw \
+  && ln -sfn /data/.openclaw/ssh /home/openclaw/.ssh \
+  && chown -h openclaw:openclaw /home/openclaw/.openclaw /home/openclaw/.ssh \
   && mkdir -p /home/linuxbrew/.linuxbrew && chown -R openclaw:openclaw /home/linuxbrew
 
 USER openclaw
